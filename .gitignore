@@ -1,0 +1,14 @@
+# Your machines, never anyone else's.
+config.json
+
+# Runtime state: job history, websocket ids, carried stills, launchd logs.
+data/
+*.log
+
+# Editor / OS / Python noise
+*.bak
+*.bak-*
+*.tmp
+__pycache__/
+*.py[cod]
+.DS_Store

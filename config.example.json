@@ -1,0 +1,104 @@
+{
+  "title": "Studio Generation Center",
+  "port": 3998,
+  "bind": "0.0.0.0",
+
+  "lanes": [
+    {
+      "id": "video-a",
+      "name": "Video Lane A",
+      "box": "your-box",
+      "host": "10.0.0.50",
+      "port": 8188,
+      "gpu": "your-box:gpu0",
+      "gpu_label": "Card 1",
+      "caps": ["video"],
+      "note": "video lane"
+    },
+    {
+      "id": "video-b",
+      "name": "Video Lane B",
+      "box": "your-box",
+      "host": "10.0.0.50",
+      "port": 8189,
+      "gpu": "your-box:gpu1",
+      "gpu_label": "Card 2",
+      "caps": ["video"],
+      "note": "video lane",
+      "shared": "someone else uses this one too"
+    },
+    {
+      "id": "picture-a",
+      "name": "Picture Lane A",
+      "box": "your-box",
+      "host": "10.0.0.50",
+      "port": 8190,
+      "gpu": "your-box:gpu0",
+      "gpu_label": "Card 1",
+      "caps": ["image"],
+      "note": "image lane"
+    },
+    {
+      "id": "picture-b",
+      "name": "Picture Lane B",
+      "box": "your-box",
+      "host": "10.0.0.50",
+      "port": 8191,
+      "gpu": "your-box:gpu1",
+      "gpu_label": "Card 2",
+      "caps": ["image"],
+      "note": "image lane"
+    },
+    {
+      "id": "spare-1",
+      "name": "Spare Box 1",
+      "box": "second-box",
+      "host": "10.0.0.51",
+      "port": 8188,
+      "gpu": "second-box:gpu0",
+      "gpu_label": "Spare",
+      "caps": ["video"],
+      "note": "video lane when it is free"
+    },
+    {
+      "id": "spare-2",
+      "name": "Spare Box 2",
+      "box": "third-box",
+      "host": "10.0.0.52",
+      "port": 8188,
+      "gpu": "third-box:gpu0",
+      "gpu_label": "Spare",
+      "caps": ["video"],
+      "note": "video lane when it is free"
+    }
+  ],
+
+  "models": {
+    "qwen_unet": "qwen_image_2.1_REPLACE_ME.safetensors",
+    "qwen_clip": "qwen3vl_8b_REPLACE_ME.safetensors",
+    "qwen_vae": "qwen_image_2.1_vae_REPLACE_ME.safetensors",
+
+    "h3_unet_fl2va": "minimax_h3_fl2va_REPLACE_ME.safetensors",
+    "h3_unet_ref2va": "minimax_h3_ref2va_REPLACE_ME.safetensors",
+    "h3_clip_nvfp4": "qwen3vl_32b_minimax_h3_REPLACE_ME.safetensors",
+    "h3_clip_int8": "qwen3vl_32b_minimax_h3_REPLACE_ME.safetensors",
+    "h3_vae_video": "minimax_h3_video_vae_REPLACE_ME.safetensors",
+    "h3_vae_audio": "minimax_h3_audio_vae_REPLACE_ME.safetensors",
+    "h3_turbo_lora": "minimax_h3_fl2v_turbo_4step_REPLACE_ME.safetensors"
+  },
+
+  "status_only": {
+    "name": "Chat model",
+    "host": "10.0.0.50",
+    "port": 8012,
+    "path": "/v1/models",
+    "gpu_label": "Cards 3+4"
+  },
+
+  "timing": {
+    "poll_seconds": 4.0,
+    "job_poll_seconds": 3.0,
+    "http_timeout": 8.0,
+    "free_settle_seconds": 2.0
+  }
+}
