@@ -1336,6 +1336,25 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # Bind first, before starting any threads: if the port is taken there is no
+    # point polling seven lanes, and a stack trace is a poor way to say
+    # "something else is already using this port".
+    try:
+        srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    except OSError as e:
+        if getattr(e, "errno", None) in (48, 98):   # EADDRINUSE on BSD / Linux
+            die("Port %d is already in use.\n\n"
+                "Either this app is already running, or something else has the port.\n"
+                "Find it with:  lsof -nP -iTCP:%d -sTCP:LISTEN\n"
+                "Or pick another port by changing \"port\" in %s."
+                % (PORT, PORT, os.path.basename(CONFIG_FILE)))
+        if getattr(e, "errno", None) == 49:         # EADDRNOTAVAIL
+            die("Cannot bind to %r. Check \"bind\" in %s: use \"0.0.0.0\" for every\n"
+                "interface, or \"127.0.0.1\" for this machine only."
+                % (BIND, os.path.basename(CONFIG_FILE)))
+        raise
+    srv.daemon_threads = True
+
     load_jobs()
     for l in LANES:
         threading.Thread(target=lane_poller, args=(l,), daemon=True).start()
@@ -1348,8 +1367,6 @@ def main():
     # is how a home directory ends up in someone's screenshot.
     log("Loaded %d lane(s) from %s" % (len(LANES), os.path.basename(CONFIG_FILE)))
     print("Config file: %s" % CONFIG_FILE, flush=True)
-    srv = ThreadingHTTPServer((BIND, PORT), Handler)
-    srv.daemon_threads = True
     srv.serve_forever()
 
 
