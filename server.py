@@ -78,7 +78,9 @@ MODEL_KEYS = (
     "h3_unet_fl2va", "h3_unet_ref2va", "h3_clip_nvfp4", "h3_clip_int8",
     "h3_vae_video", "h3_vae_audio", "h3_turbo_lora",
 )
-LANE_KEYS = ("id", "name", "host", "port", "gpu", "gpu_label", "caps")
+# The only things a lane genuinely cannot be guessed from. Everything else has
+# a safe default, because "put in your lane addresses and run it" is the point.
+LANE_KEYS = ("id", "name", "host", "port")
 
 
 def die(msg):
@@ -123,9 +125,13 @@ def load_config():
             die("Two lanes share the id %r in %s. Lane ids must be unique."
                 % (lane["id"], CONFIG_FILE))
         seen.add(lane["id"])
-        caps = lane["caps"]
+        # "caps" is optional and means "what I want this lane used for". What it
+        # can ACTUALLY do is discovered from the lane itself; the two are
+        # intersected. Leave it out and the lane is offered for whatever it has.
+        caps = lane.setdefault("caps", ["image", "video"])
         if not isinstance(caps, list) or not caps or set(caps) - {"image", "video"}:
-            die("lanes[%d] (%s): \"caps\" must be [\"image\"], [\"video\"] or both."
+            die("lanes[%d] (%s): \"caps\" must be [\"image\"], [\"video\"] or both,\n"
+                "or left out entirely to let the lane offer whatever models it has."
                 % (i, lane["id"]))
         lane.setdefault("box", "")
         lane.setdefault("note", "offline")
@@ -133,17 +139,27 @@ def load_config():
             lane["port"] = int(lane["port"])
         except (TypeError, ValueError):
             die("lanes[%d] (%s): \"port\" must be a number." % (i, lane["id"]))
+        # No "gpu" given? Assume every lane on the same host shares one card.
+        # That is the conservative guess: it may free weights that did not need
+        # freeing (costing a reload), where the opposite mistake is an
+        # out-of-memory crash. Set "gpu" explicitly on a multi-GPU box.
+        lane.setdefault("gpu", lane["host"])
+        lane.setdefault("gpu_label", lane.get("box") or lane["host"])
+        if lane.get("models") is not None and not isinstance(lane["models"], dict):
+            die("lanes[%d] (%s): \"models\" must be an object if present." % (i, lane["id"]))
 
+    # "models" is OPTIONAL. Model filenames are discovered from each lane at
+    # runtime; anything named here simply overrides what was found. Only the
+    # keys in MODEL_KEYS mean anything, so typos are worth catching early.
     models = cfg.get("models")
-    if not isinstance(models, dict):
-        die("%s needs a \"models\" object with the .safetensors filenames." % CONFIG_FILE)
-    missing = [k for k in MODEL_KEYS if not models.get(k)]
-    if missing:
-        die("\"models\" in %s is missing: %s\n"
-            "These are the filenames ComfyUI itself shows in its loader dropdowns.\n"
-            "If you only run one of the two model families, leave the others as the\n"
-            "example's placeholder strings -- they are only read when that tab is used."
-            % (CONFIG_FILE, ", ".join(missing)))
+    if models is not None:
+        if not isinstance(models, dict):
+            die("\"models\" in %s must be an object (or left out: filenames are\n"
+                "discovered from each lane automatically)." % CONFIG_FILE)
+        unknown = [k for k in models if k not in MODEL_KEYS]
+        if unknown:
+            die("\"models\" in %s has key(s) this app does not use: %s\n"
+                "Valid keys: %s" % (CONFIG_FILE, ", ".join(unknown), ", ".join(MODEL_KEYS)))
     return cfg
 
 
@@ -167,29 +183,16 @@ LANE_BY_ID = {l["id"]: l for l in LANES}
 # Omit "status_only" from config.json and the tile simply does not appear.
 FLEET_LLM = CONFIG.get("status_only") or None
 
-# Model filenames exactly as ComfyUI lists them in its loader dropdowns.
-_M = CONFIG["models"]
-QWEN_UNET = _M["qwen_unet"]
-QWEN_CLIP = _M["qwen_clip"]
-QWEN_VAE = _M["qwen_vae"]
-
-H3_UNET_FL2VA = _M["h3_unet_fl2va"]
-H3_UNET_REF2VA = _M["h3_unet_ref2va"]
-H3_CLIP_NVFP4 = _M["h3_clip_nvfp4"]
-H3_CLIP_INT8 = _M["h3_clip_int8"]
-H3_VAE_VIDEO = _M["h3_vae_video"]
-H3_VAE_AUDIO = _M["h3_vae_audio"]
-
-# The only LoRA wired in is a 4-step speed distillation. There is no quality LoRA.
-# Attached automatically on the fast rows; never on the 16/20-step rows, where it
-# would fight the schedule.
-H3_TURBO_LORA = _M["h3_turbo_lora"]
+# Optional global model overrides. Anything set here wins over what a lane
+# reports it has; anything absent is discovered. See "Model discovery" below.
+CONFIG_MODELS = {k: v for k, v in (CONFIG.get("models") or {}).items() if v}
 
 _T = CONFIG.get("timing") or {}
 POLL_SECONDS = float(_T.get("poll_seconds", 4.0))          # lane status poll
 JOB_POLL_SECONDS = float(_T.get("job_poll_seconds", 3.0))  # history poll for active jobs
 HTTP_TIMEOUT = float(_T.get("http_timeout", 8.0))
 FREE_SETTLE_SECONDS = float(_T.get("free_settle_seconds", 2.0))  # let the driver release after /free
+DISCOVER_SECONDS = float(_T.get("discover_seconds", 300.0))      # re-read a lane's model list
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -232,11 +235,23 @@ def log(text, level="info"):
     print("[%s] %s" % (level, text), flush=True)
 
 
+def join_words(items):
+    """['a','b','c'] -> 'a, b and c'."""
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return "%s and %s" % (", ".join(items[:-1]), items[-1])
+
+
 def suggest_lanes(cap):
-    """Name the lanes that can actually do `cap`, for a plain-words error."""
-    names = [l["name"] for l in LANES if cap in l["caps"]]
+    """Name the lanes that can actually do `cap` right now, for a plain-words
+    error. A lane only counts if it is set up for the job AND has the models."""
+    names = [l["name"] for l in LANES if cap in l["caps"] and abilities(l)[cap]]
     if not names:
-        return "No lane in your config can do that yet."
+        return ("No machine here has the %s models installed yet."
+                % ("picture" if cap == "image" else "video"))
     if len(names) == 1:
         return "Use %s." % names[0]
     return "Pick %s or %s." % (", ".join(names[:-1]), names[-1])
@@ -318,6 +333,232 @@ def http_post_multipart(url, fields, files, timeout=180.0):
 
 
 # ---------------------------------------------------------------------------
+# Model discovery
+#
+# You should not have to transcribe .safetensors filenames into a config file.
+# Every ComfyUI instance already knows exactly what it has installed, so we ask
+# it: GET /object_info/<LoaderNode> returns that node's dropdown contents, which
+# is the real list of files on that box.
+#
+# We then match on PATTERNS, not exact names, because the same model ships under
+# many filenames depending on who quantised it (int8_convrot, nvfp4_awq, fp8,
+# bf16, GGUF, ...). A lane with a different quant of the same model still works
+# with no configuration at all.
+#
+# Anything set under "models" in config.json overrides what is found here.
+# ---------------------------------------------------------------------------
+
+# role -> which loader's dropdown to search
+ROLE_POOL = {
+    "qwen_unet": "unet", "qwen_clip": "clip", "qwen_vae": "vae",
+    "h3_unet_fl2va": "unet", "h3_unet_ref2va": "unet",
+    "h3_clip_nvfp4": "clip", "h3_clip_int8": "clip",
+    "h3_vae_video": "vae", "h3_vae_audio": "vae",
+    "h3_turbo_lora": "lora",
+}
+
+# The loader node behind each pool, and the input whose dropdown lists the files.
+POOL_NODES = {
+    "unet": ("UNETLoader", "unet_name"),
+    "clip": ("CLIPLoader", "clip_name"),
+    "vae": ("VAELoader", "vae_name"),
+    "lora": ("LoraLoaderModelOnly", "lora_name"),
+}
+
+# all:  every substring must be present
+# none: no substring may be present
+# any:  at least one must be present (empty means no constraint)
+# prefer: ranking bonuses, earliest term worth the most
+ROLE_RULES = {
+    # -- MiniMax-H3 video ---------------------------------------------------
+    # "minimax_h3" (not bare "minimax") keeps MiniMax's other model families,
+    # e.g. minimax_music3_*, out of the video lane's results.
+    "h3_unet_fl2va": {"all": ["minimax_h3"], "none": ["ref2v"], "prefer": ["fl2v", "t2v"]},
+    "h3_unet_ref2va": {"all": ["minimax_h3", "ref2v"]},
+    # The H3 text encoder is a Qwen3-VL fine-tune, so it carries BOTH markers.
+    # That is what separates it from the image model's own qwen3vl encoder.
+    "h3_clip_nvfp4": {"all": ["qwen3vl", "minimax_h3"], "prefer": ["nvfp4", "awq"]},
+    "h3_clip_int8": {"all": ["qwen3vl", "minimax_h3"], "prefer": ["int8"]},
+    "h3_vae_video": {"all": ["minimax_h3"], "none": ["audio"], "prefer": ["video"]},
+    "h3_vae_audio": {"all": ["minimax_h3", "audio"]},
+    # The speed pack. "comfy" is preferred for a real reason: a LoRA that has not
+    # been converted to ComfyUI's diffusion_model.* key naming loads without error
+    # and then does nothing at all, which looks exactly like a bad prompt.
+    "h3_turbo_lora": {"all": ["minimax_h3"], "any": ["turbo", "4step", "lightx2v"],
+                      "prefer": ["comfy", "fl2v"]},
+    # -- Qwen-Image ---------------------------------------------------------
+    "qwen_unet": {"all": ["qwen_image"], "none": ["minimax", "vae"], "prefer": ["2.1"]},
+    "qwen_clip": {"all": ["qwen3vl"], "none": ["minimax"], "prefer": ["8b"]},
+    "qwen_vae": {"all": ["qwen_image", "vae"], "none": ["minimax"]},
+}
+
+# Quantisation markers, for choosing a build the card can actually hold.
+SMALL_QUANTS = ("nvfp4", "int8", "fp8", "w4a8", "int4", "gguf", "q8", "q6", "q5", "q4", "awq")
+BIG_QUANTS = ("bf16", "fp16", "fp32", "float16")
+
+DISCOVERY_LOCK = threading.Lock()
+DISCOVERY = {}   # lane_id -> {"models": {...}, "pools": {...}, "checked": ts, "err": str}
+
+
+def _rank(name, rule, small_card):
+    """Higher is better. Ties break towards the shorter (plainer) filename."""
+    n = name.lower()
+    score = 0.0
+    prefer = rule.get("prefer") or []
+    for i, term in enumerate(prefer):
+        if term in n:
+            score += (len(prefer) - i) * 10.0
+    if small_card:
+        if any(q in n for q in SMALL_QUANTS):
+            score += 5.0
+        elif any(q in n for q in BIG_QUANTS):
+            score -= 5.0
+    return score - len(name) * 0.01
+
+
+def pick_model(pool, rule, small_card):
+    """Best filename in `pool` for one role, or None."""
+    must_all = rule.get("all") or []
+    must_none = rule.get("none") or []
+    must_any = rule.get("any") or []
+    hits = []
+    for name in pool:
+        n = name.lower()
+        if not all(t in n for t in must_all):
+            continue
+        if any(t in n for t in must_none):
+            continue
+        if must_any and not any(t in n for t in must_any):
+            continue
+        hits.append(name)
+    if not hits:
+        return None
+    return sorted(hits, key=lambda x: (-_rank(x, rule, small_card), x))[0]
+
+
+def fetch_pool(lane, pool):
+    """The dropdown contents of one loader node on one lane."""
+    node, field = POOL_NODES[pool]
+    try:
+        info = http_get_json(lane_url(lane, "/object_info/%s" % node), timeout=8.0)
+    except Exception:
+        return []          # node not installed on this build, or lane went away
+    spec = (info or {}).get(node) or {}
+    opts = ((spec.get("input") or {}).get("required") or {}).get(field)
+    if not (isinstance(opts, list) and opts and isinstance(opts[0], list)):
+        return []
+    # Keep things that look like files. ComfyUI puts pseudo-entries in some of
+    # these lists (VAELoader offers "pixel_space", which is not a file).
+    return [o for o in opts[0] if isinstance(o, str) and "." in o]
+
+
+def discover_lane(lane):
+    """Ask a lane what it has, and work out what it can therefore do."""
+    with STATE_LOCK:
+        vram = LANE_STATE.get(lane["id"], {}).get("vram_total", 0)
+    # Under ~25GB, prefer a quantised build over bf16/fp16. Unknown counts as
+    # small: erring towards the lighter file is the safer mistake.
+    small_card = (vram or 0) < 25e9
+
+    pools, found = {}, {}
+    for pool in POOL_NODES:
+        pools[pool] = fetch_pool(lane, pool)
+    if not any(pools.values()):
+        with DISCOVERY_LOCK:
+            DISCOVERY[lane["id"]] = {"models": {}, "pools": pools, "checked": time.time(),
+                                     "err": "the lane did not answer /object_info"}
+        return
+    for role, rule in ROLE_RULES.items():
+        hit = pick_model(pools[ROLE_POOL[role]], rule, small_card)
+        if hit:
+            found[role] = hit
+
+    with DISCOVERY_LOCK:
+        entry = DISCOVERY.get(lane["id"]) or {}
+        prev, first = entry.get("models") or {}, not entry.get("checked")
+        DISCOVERY[lane["id"]] = {"models": found, "pools": pools,
+                                 "checked": time.time(), "err": ""}
+    # Say something the first time we look at a lane, and whenever the answer
+    # changes. A lane with nothing usable is worth saying out loud, once.
+    if first or found != prev:
+        able = abilities(lane)
+        if not (able["video"] or able["image"]):
+            log("%s answered, but has no Qwen-Image or MiniMax-H3 models installed"
+                % lane["name"], "models")
+        else:
+            bits = ["video: " + (describe_video(lane) if able["video"] else "no"),
+                    "pictures: " + (describe_image(lane) if able["image"] else "no"),
+                    "speed pack: " + ("yes" if able["turbo"] else "not installed")]
+            log("%s has %s" % (lane["name"], ", ".join(bits)), "models")
+
+
+def models_for(lane):
+    """Resolved filenames for a lane: detected, then config overrides on top."""
+    with DISCOVERY_LOCK:
+        out = dict((DISCOVERY.get(lane["id"]) or {}).get("models") or {})
+    out.update(CONFIG_MODELS)
+    out.update({k: v for k, v in (lane.get("models") or {}).items() if v})
+    return out
+
+
+def abilities(lane):
+    """What this lane can actually do, from the models it actually has.
+
+    Kept separate from the lane's declared `caps`, which say what it is FOR.
+    The UI offers the intersection."""
+    m = models_for(lane)
+    clip = m.get("h3_clip_nvfp4") or m.get("h3_clip_int8")
+    both_vaes = m.get("h3_vae_video") and m.get("h3_vae_audio")
+    fl2va = bool(m.get("h3_unet_fl2va") and clip and both_vaes)
+    ref2v = bool(m.get("h3_unet_ref2va") and clip and both_vaes)
+    image = bool(m.get("qwen_unet") and m.get("qwen_clip") and m.get("qwen_vae"))
+    return {"video": fl2va or ref2v, "fl2va": fl2va, "ref2v": ref2v,
+            "image": image, "turbo": bool(m.get("h3_turbo_lora"))}
+
+
+def _quant_words(filename):
+    n = (filename or "").lower()
+    for q in ("nvfp4", "int8", "fp8", "w4a8", "int4", "gguf", "bf16", "fp16"):
+        if q in n:
+            return q.upper() if len(q) <= 5 else q
+    return ""
+
+
+def describe_video(lane):
+    m = models_for(lane)
+    q = _quant_words(m.get("h3_unet_fl2va") or m.get("h3_unet_ref2va"))
+    return "MiniMax-H3" + (" (%s)" % q if q else "")
+
+
+def describe_image(lane):
+    m = models_for(lane)
+    name = (m.get("qwen_unet") or "").lower()
+    ver = " 2.1" if "2.1" in name else ""
+    q = _quant_words(name)
+    return "Qwen-Image" + ver + (" (%s)" % q if q else "")
+
+
+def missing_for(lane, mode):
+    """Which roles are absent for a mode, in plain words. Empty means good to go."""
+    m = models_for(lane)
+    need = {
+        "image": [("qwen_unet", "the Qwen-Image model"),
+                  ("qwen_clip", "its text encoder"),
+                  ("qwen_vae", "its VAE")],
+        "video": [("h3_unet_fl2va", "the H3 video model"),
+                  ("h3_vae_video", "the H3 video VAE"),
+                  ("h3_vae_audio", "the H3 audio VAE")],
+        "ref2v": [("h3_unet_ref2va", "the H3 reference model"),
+                  ("h3_vae_video", "the H3 video VAE"),
+                  ("h3_vae_audio", "the H3 audio VAE")],
+    }[mode]
+    gone = [label for key, label in need if not m.get(key)]
+    if mode in ("video", "ref2v") and not (m.get("h3_clip_nvfp4") or m.get("h3_clip_int8")):
+        gone.append("the H3 text encoder")
+    return gone
+
+
+# ---------------------------------------------------------------------------
 # Lane status poller
 # ---------------------------------------------------------------------------
 
@@ -367,6 +608,16 @@ def lane_poller(lane):
     while True:
         try:
             poll_lane_once(lane)
+            # Re-read the model list when the lane first answers, and
+            # occasionally after that, so installing a model shows up without
+            # restarting this app. Cheap: four small GETs every few minutes.
+            with STATE_LOCK:
+                up = LANE_STATE.get(lane["id"], {}).get("up")
+            if up:
+                with DISCOVERY_LOCK:
+                    last = (DISCOVERY.get(lane["id"]) or {}).get("checked", 0)
+                if time.time() - last > DISCOVER_SECONDS:
+                    discover_lane(lane)
         except Exception:
             traceback.print_exc()
         time.sleep(POLL_SECONDS)
@@ -738,11 +989,11 @@ def snap_frames(length):
     return 17 * n + 5
 
 
-def qwen_t2i_graph(p):
+def qwen_t2i_graph(p, m):
     return {
-        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": QWEN_UNET, "weight_dtype": "default"}},
-        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": QWEN_CLIP, "type": "qwen_image", "device": "default"}},
-        "3": {"class_type": "VAELoader", "inputs": {"vae_name": QWEN_VAE}},
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": m["qwen_unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": m["qwen_clip"], "type": "qwen_image", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": m["qwen_vae"]}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": p["prompt"]}},
         "5": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": p.get("negative", "")}},
         "6": {"class_type": "EmptySD3LatentImage",
@@ -757,7 +1008,7 @@ def qwen_t2i_graph(p):
     }
 
 
-def qwen_edit_graph(p):
+def qwen_edit_graph(p, m):
     """Qwen-Image-2.1 edit. TextEncodeQwenImage21 is the 2.1-native encoder: it
     takes the reference images, emits positive + negative conditioning AND the
     matched latent (its own tooltip: any other latent size shifts the edit)."""
@@ -765,9 +1016,9 @@ def qwen_edit_graph(p):
     if not refs:
         raise ValueError("Add at least one picture to work from.")
     g = {
-        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": QWEN_UNET, "weight_dtype": "default"}},
-        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": QWEN_CLIP, "type": "qwen_image", "device": "default"}},
-        "3": {"class_type": "VAELoader", "inputs": {"vae_name": QWEN_VAE}},
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": m["qwen_unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": m["qwen_clip"], "type": "qwen_image", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": m["qwen_vae"]}},
         "7": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3.1}},
         "4": {"class_type": "TextEncodeQwenImage21", "inputs": {
             "clip": ["2", 0], "prompt": p["prompt"], "negative_prompt": p.get("negative", ""),
@@ -786,16 +1037,16 @@ def qwen_edit_graph(p):
     return g
 
 
-def h3_fl2va_graph(p):
+def h3_fl2va_graph(p, m):
     """The 'cheers' recipe: fl2va unet + NVFP4 AWQ encoder + MiniMaxH3ImageToVideo,
     res_multistep/simple, 20 steps, no LoRA. first_frame/last_frame optional, and
     with neither wired it is pure text-to-video (which is what cheers was)."""
-    clip = p.get("encoder") or H3_CLIP_NVFP4
+    clip = p.get("encoder") or m.get("h3_clip_nvfp4") or m["h3_clip_int8"]
     g = {
-        "6": {"class_type": "UNETLoader", "inputs": {"unet_name": H3_UNET_FL2VA, "weight_dtype": "default"}},
+        "6": {"class_type": "UNETLoader", "inputs": {"unet_name": m["h3_unet_fl2va"], "weight_dtype": "default"}},
         "13": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip, "type": "minimax", "device": "default"}},
-        "11": {"class_type": "VAELoader", "inputs": {"vae_name": H3_VAE_VIDEO}},
-        "24": {"class_type": "VAELoader", "inputs": {"vae_name": H3_VAE_AUDIO}},
+        "11": {"class_type": "VAELoader", "inputs": {"vae_name": m["h3_vae_video"]}},
+        "24": {"class_type": "VAELoader", "inputs": {"vae_name": m["h3_vae_audio"]}},
         "104": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {
             "clip": ["13", 0], "vae": ["11", 0], "prompt": p["prompt"],
             "width": p["width"], "height": p["height"], "length": p["length"]}},
@@ -816,7 +1067,7 @@ def h3_fl2va_graph(p):
     if p.get("turbo_lora"):
         # Model-only LoRA: the H3 CLIP is separate, so only the UNET gets patched.
         g["7"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
-            "model": ["6", 0], "lora_name": H3_TURBO_LORA, "strength_model": 1.0}}
+            "model": ["6", 0], "lora_name": m["h3_turbo_lora"], "strength_model": 1.0}}
         g["16"]["inputs"]["model"] = ["7", 0]
         g["9"]["inputs"]["model"] = ["7", 0]
     if p.get("first_frame"):
@@ -828,16 +1079,16 @@ def h3_fl2va_graph(p):
     return g
 
 
-def h3_ref2va_graph(p):
+def h3_ref2va_graph(p, m):
     """ref2va: up to 9 reference images + up to 3 reference videos (frames at 24fps,
     2-15s each) with the first video's audio carried through. INT8 encoder by default.
     Audio is NEVER fed in as TTS -- H3 speaks the dialogue in the prompt itself."""
-    clip = p.get("encoder") or H3_CLIP_INT8
+    clip = p.get("encoder") or m.get("h3_clip_int8") or m["h3_clip_nvfp4"]
     g = {
-        "159": {"class_type": "UNETLoader", "inputs": {"unet_name": H3_UNET_REF2VA, "weight_dtype": "default"}},
+        "159": {"class_type": "UNETLoader", "inputs": {"unet_name": m["h3_unet_ref2va"], "weight_dtype": "default"}},
         "160": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip, "type": "minimax", "device": "default"}},
-        "162": {"class_type": "VAELoader", "inputs": {"vae_name": H3_VAE_VIDEO}},
-        "163": {"class_type": "VAELoader", "inputs": {"vae_name": H3_VAE_AUDIO}},
+        "162": {"class_type": "VAELoader", "inputs": {"vae_name": m["h3_vae_video"]}},
+        "163": {"class_type": "VAELoader", "inputs": {"vae_name": m["h3_vae_audio"]}},
         "164": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
             "clip": ["160", 0], "vae": ["162", 0], "audio_vae": ["163", 0], "prompt": p["prompt"],
             "width": p["width"], "height": p["height"], "length": p["length"],
@@ -1068,11 +1319,28 @@ class Handler(BaseHTTPRequestHandler):
             snap = {k: dict(v) for k, v in LANE_STATE.items()}
         for l in LANES:
             st = snap.get(l["id"], {})
+            able = abilities(l)
+            with DISCOVERY_LOCK:
+                disc = dict(DISCOVERY.get(l["id"]) or {})
+            # `caps` is what this lane is FOR; `able` is what it HAS. The UI
+            # offers the intersection, and says which side said no.
+            effective = [c for c in l["caps"] if able[c]] if disc.get("checked") else list(l["caps"])
             out.append({
                 "id": l["id"], "name": l["name"], "box": l["box"], "note": l["note"],
                 "shared": l.get("shared", ""),
                 "endpoint": "%s:%d" % (l["host"], l["port"]), "gpu": l["gpu"], "gpu_label": l["gpu_label"],
-                "caps": l["caps"],
+                "caps": effective, "declared_caps": l["caps"],
+                "able": able,
+                "discovered": bool(disc.get("checked")),
+                "has": {
+                    "video": describe_video(l) if able["video"] else "",
+                    "image": describe_image(l) if able["image"] else "",
+                    "turbo": able["turbo"],
+                    "ref2v": able["ref2v"],
+                },
+                "files": models_for(l),
+                "missing_video": missing_for(l, "video") if ("video" in l["caps"] and not able["video"]) else [],
+                "missing_image": missing_for(l, "image") if ("image" in l["caps"] and not able["image"]) else [],
                 "up": bool(st.get("up")), "err": st.get("err", ""),
                 "device": st.get("device", ""),
                 "vram_free": st.get("vram_free", 0), "vram_total": st.get("vram_total", 0),
@@ -1180,11 +1448,18 @@ class Handler(BaseHTTPRequestHandler):
         steps = max(1, min(80, int(p.get("steps") or 20)))
         kind = p.get("kind")
         mode = p.get("mode")
+        m = models_for(lane)
+        able = abilities(lane)
 
         if kind == "image":
             if "image" not in lane["caps"]:
-                return self.send_json({"ok": False, "error": "%s does not make pictures. %s"
+                return self.send_json({"ok": False, "error": "%s is not set up as a picture lane. %s"
                                        % (lane["name"], suggest_lanes("image"))}, 400)
+            if not able["image"]:
+                return self.send_json({"ok": False, "error":
+                                       "%s does not have the picture models installed (missing %s). %s"
+                                       % (lane["name"], join_words(missing_for(lane, "image")),
+                                          suggest_lanes("image"))}, 400)
             cfg = float(p.get("cfg") or 2.5)
             w = int(p.get("width") or 1328)
             h = int(p.get("height") or 1328)
@@ -1193,18 +1468,24 @@ class Handler(BaseHTTPRequestHandler):
                     "steps": steps, "cfg": cfg, "seed": seed,
                     "ref_images": p.get("ref_images") or [], "resolution": p.get("resolution", 1024)}
             try:
-                graph = qwen_edit_graph(args) if mode == "edit" else qwen_t2i_graph(args)
+                graph = qwen_edit_graph(args, m) if mode == "edit" else qwen_t2i_graph(args, m)
             except ValueError as e:
                 return self.send_json({"ok": False, "error": str(e)}, 400)
             meta = {"prompt": prompt, "negative": p.get("negative", ""), "seed": seed, "steps": steps,
-                    "cfg": cfg, "width": w, "height": h, "model": "Qwen-Image-2.1 INT8",
+                    "cfg": cfg, "width": w, "height": h, "model": describe_image(lane),
+                    "model_file": m.get("qwen_unet", ""),
                     "refs": len(args["ref_images"])}
             return self.send_json(dispatch(lane, graph, "image", mode, meta))
 
         if kind == "video":
             if "video" not in lane["caps"]:
-                return self.send_json({"ok": False, "error": "%s does not make videos. %s"
+                return self.send_json({"ok": False, "error": "%s is not set up as a video lane. %s"
                                        % (lane["name"], suggest_lanes("video"))}, 400)
+            if not able["video"]:
+                return self.send_json({"ok": False, "error":
+                                       "%s does not have the video models installed (missing %s). %s"
+                                       % (lane["name"], join_words(missing_for(lane, "video")),
+                                          suggest_lanes("video"))}, 400)
             w = int(p.get("width") or 960)
             h = int(p.get("height") or 544)
             w, h = (w // 32) * 32, (h // 32) * 32
@@ -1212,6 +1493,13 @@ class Handler(BaseHTTPRequestHandler):
             # The turbo LoRA is a 4-step distillation: attach it for the fast rows (<= 8 steps),
             # never above that, where it fights the schedule and smooths detail away.
             turbo = bool(p.get("turbo_lora")) if p.get("turbo_lora") is not None else (steps <= 8)
+            if turbo and not able["turbo"]:
+                # No speed pack on this box. Silently running a 4-step schedule
+                # without its LoRA produces mush, so refuse rather than disappoint.
+                return self.send_json({"ok": False, "error":
+                                       "%s has no speed pack installed, so the quick settings would come out "
+                                       "mushy. Pick Middle, Good or Best, or install a MiniMax-H3 turbo LoRA "
+                                       "on that machine." % lane["name"]}, 400)
             args = {"prompt": prompt, "width": w, "height": h, "length": length, "steps": steps,
                     "turbo_lora": turbo,
                     "seed": seed, "encoder": p.get("encoder") or None,
@@ -1220,23 +1508,37 @@ class Handler(BaseHTTPRequestHandler):
                     "keep_audio": bool(p.get("keep_audio", True)),
                     "ref_image_size": p.get("ref_image_size", "match")}
             if mode == "ref2v":
+                if not able["ref2v"]:
+                    return self.send_json({"ok": False, "error":
+                                           "%s does not have the H3 reference model installed (missing %s), so it "
+                                           "cannot copy people or clips. It can still do the other video modes."
+                                           % (lane["name"], join_words(missing_for(lane, "ref2v")))}, 400)
                 if not args["ref_images"] and not args["ref_videos"]:
                     return self.send_json({"ok": False, "error":
                                            "Add at least one picture or clip for it to work from."}, 400)
-                graph = h3_ref2va_graph(args)
-                model = "H3 ref2va INT8"
+                graph = h3_ref2va_graph(args, m)
+                model = describe_video(lane) + " reference"
             elif mode == "fl2va":
+                if not able["fl2va"]:
+                    return self.send_json({"ok": False, "error":
+                                           "%s does not have the first-frame H3 model installed (missing %s)."
+                                           % (lane["name"], join_words(missing_for(lane, "video")))}, 400)
                 if not args["first_frame"] and not args["last_frame"]:
                     return self.send_json({"ok": False, "error":
                                            "Add a starting picture (an ending picture is optional)."}, 400)
-                graph = h3_fl2va_graph(args)
-                model = "H3 fl2va"
+                graph = h3_fl2va_graph(args, m)
+                model = describe_video(lane) + " first frame"
             else:
+                if not able["fl2va"]:
+                    return self.send_json({"ok": False, "error":
+                                           "%s does not have the H3 text-to-video model installed (missing %s)."
+                                           % (lane["name"], join_words(missing_for(lane, "video")))}, 400)
                 args["first_frame"] = args["last_frame"] = None
-                graph = h3_fl2va_graph(args)
-                model = "H3 fl2va (text-to-video)"
+                graph = h3_fl2va_graph(args, m)
+                model = describe_video(lane) + " text-to-video"
             meta = {"prompt": prompt, "seed": seed, "steps": steps, "turbo_lora": turbo, "width": w, "height": h,
                     "length": length, "seconds": round(length / 24.0, 2), "model": model,
+                    "model_file": m.get("h3_unet_ref2va" if mode == "ref2v" else "h3_unet_fl2va", ""),
                     "refs": len(args["ref_images"]), "ref_videos": len(args["ref_videos"]),
                     "chained_from": p.get("chained_from")}
             return self.send_json(dispatch(lane, graph, "video", mode, meta))

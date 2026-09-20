@@ -142,6 +142,15 @@
   .lightbox{position:fixed;inset:0;background:rgba(0,0,0,.93);display:none;align-items:center;
     justify-content:center;z-index:99;padding:22px;cursor:zoom-out}
   .lightbox.on{display:flex}
+  .hasdet{margin-top:12px;border-top:1px solid var(--border);padding-top:8px}
+  .hasdet summary{cursor:pointer;color:var(--dim);font-size:12px;letter-spacing:.06em;
+    text-transform:uppercase}
+  .hasdet summary:hover{color:var(--accent2)}
+  .hasrow{padding:7px 0;border-bottom:1px solid rgba(224,132,42,0.10);font-size:13px}
+  .hasrow:last-child{border-bottom:0}
+  .hasfiles{margin:4px 0 0 14px;font-size:11px;color:var(--dim);
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+  .hasfiles .k{display:inline-block;min-width:130px}
   .lightbox img{max-width:100%;max-height:100%;object-fit:contain}
   a{color:var(--accent2)}
 </style>
@@ -158,6 +167,14 @@
 <div class="card">
   <h2>Machines <span class="tag" id="laneTag">checking</span></h2>
   <div class="lanes" id="laneStrip"></div>
+  <details class="hasdet">
+    <summary>What each machine has</summary>
+    <div id="hasBox"></div>
+    <div class="k" style="margin-top:8px">
+      Found by asking each machine what it has installed. Set <code>models</code> in
+      <code>config.json</code> to pin a specific file instead.
+    </div>
+  </details>
 </div>
 
 <div class="tabs">
@@ -438,9 +455,9 @@ const VID_Q_WHY = {
   4:'speed pack on, quickest, good for trying an idea',
   6:'speed pack on, a little more detail',
   8:'speed pack on, best of the quick ones',
-  12:'no speed pack, in between, can look soft',
-  16:'no speed pack, close to best, a bit quicker',
-  20:'no speed pack, what every good clip we made used',
+  12:'runs clean, in between, can look soft',
+  16:'runs clean, close to best, a bit quicker',
+  20:'runs clean, what every good clip we made used',
 };
 
 /* Shapes: plain name is the label, pixel size is grey text underneath. */
@@ -461,9 +478,24 @@ const VID_SHAPES = [
   {id:'cust', t:'Custom size', custom:true},
 ];
 
-function fillQuality(sel, list){
+function fillQuality(sel, list, disable){
+  const off = disable || (() => false);
   $(sel).innerHTML = list.map(q =>
-    '<option value="'+q.v+'"'+(q.def?' selected':'')+'>'+q.t+'</option>').join('');
+    '<option value="'+q.v+'"'+(q.def?' selected':'')+(off(q)?' disabled':'')+'>'
+    + q.t + (off(q) ? ' \u2014 not available here' : '') + '</option>').join('');
+}
+/* The 4/6/8 step rows are a 4-step distillation and are only honest with the
+   speed LoRA attached. Without it they render mush, so they are turned off
+   rather than left to disappoint. */
+function videoLane(){ return LANES.find(l => l.id === $('#v_lane').value); }
+function applySpeedPack(){
+  const l = videoLane(), has = !l || !l.up || l.has.turbo;
+  const cur = +$('#v_q').value;
+  fillQuality('#v_q', VID_Q, q => !has && q.v <= 8);
+  if(has || cur > 8) $('#v_q').value = cur;
+  else $('#v_q').value = 12;
+  $('#v_qNote').textContent = (!has ? 'the quick ones need a speed pack, which this machine does not have \u00b7 ' : '')
+    + VID_Q_WHY[+$('#v_q').value];
 }
 function fillShapes(sel, list){
   $(sel).innerHTML = list.map(s => '<option value="'+s.id+'">'+s.t+'</option>').join('');
@@ -541,6 +573,7 @@ async function pollLanes(){
         ? '<span class="k">'+l.gpu_label+'</span><br>'
           + fmtGB(l.vram_free)+' of '+fmtGB(l.vram_total)+' GB memory free<br>'
           + (waiting ? '<span class="k">busy &middot; '+waiting+' job'+(waiting>1?'s':'')+' waiting</span>' : 'free right now')
+          + hasLine(l)
         : '<span style="color:var(--red)">offline</span><br>'+l.note;
       return '<div class="lane '+cls+'"><div class="top"><span class="dot"></span>'
         +'<span class="nm">'+l.name+'</span></div><div class="meta">'+meta+'</div>'
@@ -556,40 +589,96 @@ async function pollLanes(){
     const up = LANES.filter(l=>l.up).length;
     $('#laneTag').textContent = up + ' of ' + LANES.length + ' ready';
     fillLanePickers();
+    renderHas();
   }catch(e){ $('#laneTag').textContent = 'cannot reach the machines'; }
 }
+/* What a machine actually has, in plain words. Filenames live in the tooltip
+   and in the "What each machine has" expander, never in the strip itself. */
+function hasLine(l){
+  if(!l.discovered) return '<br><span class="k">checking what it has\u2026</span>';
+  const bits = [];
+  if(l.has.video) bits.push(l.has.video);
+  if(l.has.image) bits.push(l.has.image);
+  if(!bits.length) return '<br><span class="warn">no models found on this machine</span>';
+  const tip = Object.keys(l.files).sort().map(k => k+': '+l.files[k]).join('\n');
+  return '<br><span class="k" title="'+esc(tip)+'">'+esc(bits.join(' \u00b7 '))+'</span>'
+    + (l.has.video && !l.has.turbo ? '<br><span class="warn">no speed pack</span>' : '');
+}
+
+/* The expander under the strip: every machine, every filename it picked. */
+function renderHas(){
+  const box = $('#hasBox'); if(!box) return;
+  const rows = LANES.map(l => {
+    if(!l.up) return '<div class="hasrow"><b>'+esc(l.name)+'</b> <span class="k">offline, nothing to read</span></div>';
+    if(!l.discovered) return '<div class="hasrow"><b>'+esc(l.name)+'</b> <span class="k">still checking\u2026</span></div>';
+    const keys = Object.keys(l.files).sort();
+    if(!keys.length) return '<div class="hasrow"><b>'+esc(l.name)+'</b> '
+      + '<span class="warn">no Qwen-Image or MiniMax-H3 models found here</span></div>';
+    const plain = [];
+    if(l.has.video) plain.push('video: '+l.has.video + (l.has.ref2v ? ' (can copy people and clips)' : ''));
+    if(l.has.image) plain.push('pictures: '+l.has.image);
+    plain.push('speed pack: ' + (l.has.turbo ? 'installed' : 'not installed'));
+    return '<div class="hasrow"><b>'+esc(l.name)+'</b> <span class="k">'+esc(plain.join(' \u00b7 '))+'</span>'
+      + '<div class="hasfiles">'+keys.map(k =>
+          '<div><span class="k">'+esc(k)+'</span> '+esc(l.files[k])+'</div>').join('')+'</div></div>';
+  }).join('');
+  box.innerHTML = rows;
+}
+
 let _laneSig = '';
 function fillLanePickers(){
   // Only rebuild when something actually changed, otherwise a dropdown the user
   // has open snaps shut every four seconds.
-  const sig = JSON.stringify(LANES.map(l => [l.id, l.up, l.running + l.pending]));
+  const sig = JSON.stringify(LANES.map(l =>
+    [l.id, l.up, l.running + l.pending, l.caps.join(), l.has.turbo]));
   if(sig === _laneSig) return;
   _laneSig = sig;
   const fill = (sel, note, cap) => {
     const el = $(sel), prev = el.value;
-    const opts = LANES.filter(l => l.caps.includes(cap));
-    el.innerHTML = opts.map(l => '<option value="'+l.id+'"'+(l.up?'':' disabled')+'>'
-      + l.name + (l.up ? ((l.running+l.pending) ? ' - busy' : ' - free') : ' - offline') + '</option>').join('');
-    if(prev && opts.some(o => o.id === prev && o.up)) el.value = prev;
-    else { const firstFree = opts.find(o => o.up && !(o.running+o.pending)) || opts.find(o => o.up);
+    // A machine set up for this job stays LISTED even when it lacks the models,
+    // greyed out with the reason. Silently dropping it just looks broken.
+    const opts = LANES.filter(l => l.declared_caps.includes(cap));
+    const ready = l => l.up && l.caps.includes(cap);
+    el.innerHTML = opts.map(l => {
+      const why = !l.up ? ' - offline'
+        : !l.caps.includes(cap) ? (l.discovered ? ' - no ' + (cap === 'image' ? 'picture' : 'video') + ' models'
+                                                : ' - still checking')
+        : ((l.running + l.pending) ? ' - busy' : ' - free');
+      return '<option value="'+l.id+'"'+(ready(l)?'':' disabled')+'>'+esc(l.name)+why+'</option>';
+    }).join('');
+    if(prev && opts.some(o => o.id === prev && ready(o))) el.value = prev;
+    else { const firstFree = opts.find(o => ready(o) && !(o.running+o.pending)) || opts.find(ready);
            if(firstFree) el.value = firstFree.id; }
-    const cur = opts.find(o => o.id === el.value);
-    $(note).textContent = cur
-      ? cur.gpu_label + (cur.shared ? ' · ' + cur.shared : '')
-      : 'nothing available right now';
+    $(note).textContent = pickerNote(opts.find(o => o.id === el.value), cap);
   };
   fill('#i_lane','#i_laneNote','image');
   fill('#v_lane','#v_laneNote','video');
   fill('#w_lane','#w_laneNote','video');
+  applySpeedPack();
+}
+
+/* The grey line under a machine picker: where it runs, and what it is missing. */
+function pickerNote(l, cap){
+  if(!l) return 'nothing available right now';
+  const bits = [l.gpu_label];
+  if(l.shared) bits.push(l.shared);
+  if(l.up && l.discovered){
+    const miss = cap === 'image' ? l.missing_image : l.missing_video;
+    if(miss && miss.length) bits.push('missing ' + miss.join(', '));
+    else if(cap === 'video' && !l.has.turbo) bits.push('no speed pack installed');
+  }
+  return bits.join(' \u00b7 ');
 }
 /* Keep the little grey line under a machine picker honest when the user changes
    it themselves, not only when the poller redraws. */
-function laneNote(sel, note){
-  const cur = LANES.find(l => l.id === $(sel).value);
-  $(note).textContent = cur ? cur.gpu_label + (cur.shared ? ' · ' + cur.shared : '') : '';
+function laneNote(sel, note, cap){
+  $(note).textContent = pickerNote(LANES.find(l => l.id === $(sel).value), cap);
 }
-[['#i_lane','#i_laneNote'],['#v_lane','#v_laneNote'],['#w_lane','#w_laneNote']]
-  .forEach(([s,n]) => { $(s).onchange = () => laneNote(s,n); });
+[['#i_lane','#i_laneNote','image'],['#v_lane','#v_laneNote','video'],['#w_lane','#w_laneNote','video']]
+  .forEach(([s,n,c]) => { $(s).onchange = () => {
+    laneNote(s,n,c);
+    if(s === '#v_lane'){ applySpeedPack(); refreshVideo(); }
+  }; });
 
 /* ── PICTURE tab ─────────────────────────────────────────────── */
 fillQuality('#i_q', IMG_Q); fillShapes('#i_shape', IMG_SHAPES);
@@ -656,7 +745,9 @@ function vidSize(){
 function refreshVideo(){
   const q = +$('#v_q').value, f = +$('#v_len').value, [w,h] = vidSize();
   const s = shapeOf(VID_SHAPES, '#v_shape'), m = $('#v_mode').value;
-  $('#v_qNote').textContent = VID_Q_WHY[q];
+  const vl = videoLane(), noPack = vl && vl.up && !vl.has.turbo;
+  $('#v_qNote').textContent = (noPack ? 'the quick ones need a speed pack, which this machine does not have \u00b7 ' : '')
+    + VID_Q_WHY[q];
   $('#v_customSize').classList.toggle('hidden', !s.custom);
   $('#v_shapeNote').innerHTML = s.custom ? 'your own size'
     : (s.w + ' × ' + s.h + ' pixels' + (s.best
